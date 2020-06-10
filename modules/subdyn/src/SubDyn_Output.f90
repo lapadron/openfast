@@ -4257,6 +4257,11 @@ SUBROUTINE SDOut_MapOutputs( CurrentTime, u,p,x, y, m, AllOuts, ErrStat, ErrMsg 
    uddout =0 !Initialize and populate with Udotdot data
    uddout(1          : p%URbarL         ) = m%UR_bar_dotdot
    uddout(p%URbarL+1 : p%URbarL+p%DOFL  ) = m%UL_dotdot
+
+   IF (p%SeismicInp) THEN
+    yout(p%URbarL+p%DOFL+1  :p%URbarL+p%DOFL+6*p%Nreact) = p%RRbase*m%Ug
+    uddout(p%URbarL+p%DOFL+1:p%URbarL+p%DOFL+6*p%Nreact) = p%RRbase*m%Uddotg
+   END IF
          
       ! Only generate member-based outputs for the number of user-requested member outputs
       !Now store and identify needed output as requested by user
