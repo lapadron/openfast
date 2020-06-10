@@ -32,9 +32,10 @@ MODULE SD_FEM
   INTEGER(IntKi),   PARAMETER  :: ReactCol        = 7                     ! Number of columns in reaction dof array (JointID,RctTDxss,RctTDYss,RctTDZss,RctRDXss,RctRDYss,RctRDZss)
   INTEGER(IntKi),   PARAMETER  :: InterfCol       = 7                     ! Number of columns in interf matrix (JointID,ItfTDxss,ItfTDYss,ItfTDZss,ItfRDXss,ItfRDYss,ItfRDZss)
   INTEGER(IntKi),   PARAMETER  :: MaxNodesPerElem = 2                     ! Maximum number of nodes per element (currently 2)
-  INTEGER(IntKi),   PARAMETER  :: MembersCol      = MaxNodesPerElem + 3   ! Number of columns in Members (MemberID,MJointID1,MJointID2,MPropSetID1,MPropSetID2,COSMID) 
+  INTEGER(IntKi),   PARAMETER  :: MembersCol      = MaxNodesPerElem + 4   ! Number of columns in Members (MemberID,MJointID1,MJointID2,MPropSetID1,MPropSetID2,LPM) 
   INTEGER(IntKi),   PARAMETER  :: PropSetsCol     = 6                     ! Number of columns in PropSets  (PropSetID,YoungE,ShearG,MatDens,XsecD,XsecT)  !bjj: this really doesn't need to store k, does it? or is this supposed to be an ID, in which case we shouldn't be storing k (except new property sets), we should be storing IDs
   INTEGER(IntKi),   PARAMETER  :: XPropSetsCol    = 10                    ! Number of columns in XPropSets (PropSetID,YoungE,ShearG,MatDens,XsecA,XsecAsx,XsecAsy,XsecJxx,XsecJyy,XsecJ0)
+  INTEGER(IntKi),   PARAMETER  :: SLPMPropSetsCol = 19                    ! Number of columns in SLPMPropSets (PropSetID,kh,kr,kt,ch,cr,ct,mh,Ir,mt,h1,h2,h3,Kz,Ktor)
   INTEGER(IntKi),   PARAMETER  :: COSMsCol        = 10                    ! Number of columns in (cosine matrices) COSMs (COSMID,COSM11,COSM12,COSM13,COSM21,COSM22,COSM23,COSM31,COSM32,COSM33)
   INTEGER(IntKi),   PARAMETER  :: CMassCol        = 5                     ! Number of columns in Concentrated Mass (CMJointID,JMass,JMXX,JMYY,JMZZ)
   ! Indices in Members table
@@ -166,7 +167,7 @@ SUBROUTINE SD_ReIndex_CreateNodesAndElems(Init,p, ErrStat, ErrMsg)
       ! Column 1  : member index (instead of MemberID)
       p%Elems(iMem,     1)  = iMem
       ! Column 2-3: Joint index (instead of JointIDs)
-      p%Elems(iMem,     1)  = iMem  ! NOTE: element/member number (not MemberID)
+      !p%Elems(iMem,     1)  = iMem  ! NOTE: element/member number (not MemberID)
       do iNode=2,3
          p%Elems(iMem,iNode) = FINDLOCI(Init%Joints(:,1), Init%Members(iMem, iNode) ) 
          if (p%Elems(iMem,iNode)<=0) then
@@ -184,7 +185,9 @@ SUBROUTINE SD_ReIndex_CreateNodesAndElems(Init,p, ErrStat, ErrMsg)
          if (p%Elems(iMem,n)<=0) then
             CALL Fatal('For MemberID '//TRIM(Num2LStr(Init%Members(iMem,1)))//'the PropSetID'//TRIM(Num2LStr(n-3))//' is not in the'//trim(sType)//' table!')
          endif
-      END DO !n, loop through property ids         
+      END DO !n, loop through property ids  
+      ! Column 6  : SLPM Flag
+      p%Elems(iMem,     6)  = Init%Members(iMem, 6)      
    END DO !iMem, loop through members
     
    ! TODO in theory, we shouldn't need these anymore
@@ -229,10 +232,10 @@ SUBROUTINE SD_Discrt(Init,p, ErrStat, ErrMsg)
       RETURN
    ENDIF
    
-   ! Total number of element   
-   Init%NElem = p%NMembers*Init%NDiv  
-   ! Total number of nodes - Depends on division and number of nodes per element
-   Init%NNode = Init%NJoints + ( Init%NDiv - 1 )*p%NMembers 
+   ! Total number of elements (SLPM elements are not divided)   
+   Init%NElem = (p%NMembers - p%NSLPMEl)*Init%NDiv + p%NSLPMEl
+   ! Total number of nodes - Depends on division and number of nodes per element, and number of SLPM elements
+   Init%NNode = Init%NJoints + ( Init%NDiv - 1 )*(p%NMembers - p%NSLPMEl) 
    Init%NNode = Init%NNode + (NNE - 2)*Init%NElem 
    
    ! check the number of interior modes
@@ -297,89 +300,99 @@ SUBROUTINE SD_Discrt(Init,p, ErrStat, ErrMsg)
              CALL Fatal(' Same starting and ending node in the member.')
              RETURN
           ENDIF
-  
           
           Init%MemberNodes(I,           1) = Node1
-          Init%MemberNodes(I, Init%NDiv+1) = Node2
-          
-          IF  ( ( .not. EqualRealNos(TempProps(Prop1, 2),TempProps(Prop2, 2) ) ) &
-           .OR. ( .not. EqualRealNos(TempProps(Prop1, 3),TempProps(Prop2, 3) ) ) &
-           .OR. ( .not. EqualRealNos(TempProps(Prop1, 4),TempProps(Prop2, 4) ) ) )  THEN
-          
-             CALL Fatal(' Material E,G and rho in a member must be the same')
-             RETURN
-          ENDIF
 
-          x1 = Init%Nodes(Node1, 2)
-          y1 = Init%Nodes(Node1, 3)
-          z1 = Init%Nodes(Node1, 4)
+          IF (Init%Members(I,6) == 0) THEN ! Member is a beam. Let's divide
 
-          x2 = Init%Nodes(Node2, 2)
-          y2 = Init%Nodes(Node2, 3)
-          z2 = Init%Nodes(Node2, 4)
+             Init%MemberNodes(I, Init%NDiv+1) = Node2
           
-          dx = ( x2 - x1 )/Init%NDiv
-          dy = ( y2 - y1 )/Init%NDiv
-          dz = ( z2 - z1 )/Init%NDiv
+             IF  ( ( .not. EqualRealNos(TempProps(Prop1, 2),TempProps(Prop2, 2) ) ) &
+              .OR. ( .not. EqualRealNos(TempProps(Prop1, 3),TempProps(Prop2, 3) ) ) &
+              .OR. ( .not. EqualRealNos(TempProps(Prop1, 4),TempProps(Prop2, 4) ) ) )  THEN
           
-          d1 = TempProps(Prop1, 5)
-          t1 = TempProps(Prop1, 6)
+                CALL Fatal(' Material E,G and rho in a member must be the same')
+                RETURN
+             ENDIF
 
-          d2 = TempProps(Prop2, 5)
-          t2 = TempProps(Prop2, 6)
+             x1 = Init%Nodes(Node1, 2)
+             y1 = Init%Nodes(Node1, 3)
+             z1 = Init%Nodes(Node1, 4)
+
+             x2 = Init%Nodes(Node2, 2)
+             y2 = Init%Nodes(Node2, 3)
+             z2 = Init%Nodes(Node2, 4)
           
-          dd = ( d2 - d1 )/Init%NDiv
-          dt = ( t2 - t1 )/Init%NDiv
+             dx = ( x2 - x1 )/Init%NDiv
+             dy = ( y2 - y1 )/Init%NDiv
+             dz = ( z2 - z1 )/Init%NDiv
+          
+             d1 = TempProps(Prop1, 5)
+             t1 = TempProps(Prop1, 6)
+
+             d2 = TempProps(Prop2, 5)
+             t2 = TempProps(Prop2, 6)
+          
+             dd = ( d2 - d1 )/Init%NDiv
+             dt = ( t2 - t1 )/Init%NDiv
           
              ! If both dd and dt are 0, no interpolation is needed, and we can use the same property set for new nodes/elements. otherwise we'll have to create new properties for each new node
-          CreateNewProp = .NOT. ( EqualRealNos( dd , 0.0_ReKi ) .AND.  EqualRealNos( dt , 0.0_ReKi ) )  
+             CreateNewProp = .NOT. ( EqualRealNos( dd , 0.0_ReKi ) .AND.  EqualRealNos( dt , 0.0_ReKi ) )  
           
-          ! node connect to Node1
-          knode = knode + 1
-          Init%MemberNodes(I, 2) = knode
-          CALL SetNewNode(knode, x1+dx, y1+dy, z1+dz, Init)
-              
-          IF ( CreateNewProp ) THEN   
-               ! create a new property set 
-               ! k, E, G, rho, d, t, Init
-               kprop = kprop + 1
-               CALL SetNewProp(kprop, TempProps(Prop1, 2), TempProps(Prop1, 3), TempProps(Prop1, 4), d1+dd, t1+dt, TempProps)           
-               kelem = kelem + 1
-               CALL SetNewElem(kelem, Node1, knode, Prop1, kprop, p)  
-               nprop = kprop              
-          ELSE
-               kelem = kelem + 1
-               CALL SetNewElem(kelem, Node1, knode, Prop1, Prop1, p)                
-               nprop = Prop1 
-          ENDIF
-          
-          ! interior nodes
-          DO J = 2, (Init%NDiv-1)
+             ! node connect to Node1
              knode = knode + 1
-             Init%MemberNodes(I, J+1) = knode
-
-             CALL SetNewNode(knode, x1 + J*dx, y1 + J*dy, z1 + J*dz, Init)
-             
+             Init%MemberNodes(I, 2) = knode
+             CALL SetNewNode(knode, x1+dx, y1+dy, z1+dz, Init)
+              
              IF ( CreateNewProp ) THEN   
                   ! create a new property set 
-                  ! k, E, G, rho, d, t, Init               
+                  ! k, E, G, rho, d, t, Init
                   kprop = kprop + 1
-                  CALL SetNewProp(kprop, TempProps(Prop1, 2), TempProps(Prop1, 3),&
-                                  Init%PropSets(Prop1, 4), d1 + J*dd, t1 + J*dt, &
-                                  TempProps)           
+                  CALL SetNewProp(kprop, TempProps(Prop1, 2), TempProps(Prop1, 3), TempProps(Prop1, 4), d1+dd, t1+dt, TempProps)           
                   kelem = kelem + 1
-                  CALL SetNewElem(kelem, knode-1, knode, nprop, kprop, p)
-                  nprop = kprop                
+                  CALL SetNewElem(kelem, Node1, knode, Prop1, kprop, 0, p)  
+                  nprop = kprop              
              ELSE
                   kelem = kelem + 1
-                  CALL SetNewElem(kelem, knode-1, knode, nprop, nprop, p)         
-                   
+                  CALL SetNewElem(kelem, Node1, knode, Prop1, Prop1, 0, p)                
+                  nprop = Prop1 
              ENDIF
-          ENDDO
           
-          ! the element connect to Node2
-          kelem = kelem + 1
-          CALL SetNewElem(kelem, knode, Node2, nprop, Prop2, p)                
+             ! interior nodes
+             DO J = 2, (Init%NDiv-1)
+                knode = knode + 1
+                Init%MemberNodes(I, J+1) = knode
+
+                CALL SetNewNode(knode, x1 + J*dx, y1 + J*dy, z1 + J*dz, Init)
+             
+                IF ( CreateNewProp ) THEN   
+                     ! create a new property set 
+                     ! k, E, G, rho, d, t, Init               
+                     kprop = kprop + 1
+                     CALL SetNewProp(kprop, TempProps(Prop1, 2), TempProps(Prop1, 3),&
+                                  Init%PropSets(Prop1, 4), d1 + J*dd, t1 + J*dt, &
+                                  TempProps)           
+                     kelem = kelem + 1
+                     CALL SetNewElem(kelem, knode-1, knode, nprop, kprop, 0, p)
+                     nprop = kprop                
+                ELSE
+                     kelem = kelem + 1
+                     CALL SetNewElem(kelem, knode-1, knode, nprop, nprop, 0, p)         
+                   
+                ENDIF
+             ENDDO
+          
+             ! the element connect to Node2
+             kelem = kelem + 1
+             CALL SetNewElem(kelem, knode, Node2, nprop, Prop2, 0, p)     
+
+          ELSE IF (Init%Members(I,6) == 1) THEN ! Member is a SLPM. No division should be performed
+          ! Taking into accout that Elems was fully reinitialized and connectivity needs to be done again using SetNewElem
+          ! while Nodes are not reinitialized, but appended to NNodes, we just need to set one new element
+             Init%MemberNodes(I, 2) = Node2
+             kelem = kelem + 1
+             CALL SetNewElem(kelem, Node1, Node2, Prop1, Prop1, 1, p)  
+          ENDIF           
 
        ENDDO ! loop over all members
        !
@@ -474,12 +487,13 @@ END SUBROUTINE SetNewNode
 
 !------------------------------------------------------------------------------------------------------
 !> Set properties of element k
-SUBROUTINE SetNewElem(k, n1, n2, p1, p2, p)
+SUBROUTINE SetNewElem(k, n1, n2, p1, p2, LPMFlag, p)
    INTEGER,                INTENT(IN   )   :: k
    INTEGER,                INTENT(IN   )   :: n1
    INTEGER,                INTENT(IN   )   :: n2
    INTEGER,                INTENT(IN   )   :: p1
    INTEGER,                INTENT(IN   )   :: p2
+   INTEGER,                INTENT(IN   )   :: LPMFlag
    TYPE(SD_ParameterType), INTENT(INOUT)   :: p
    
    p%Elems(k, 1) = k
@@ -487,6 +501,7 @@ SUBROUTINE SetNewElem(k, n1, n2, p1, p2, p)
    p%Elems(k, 3) = n2
    p%Elems(k, iMProp  ) = p1
    p%Elems(k, iMProp+1) = p2
+   p%Elems(k, iMProp+2) = LPMFlag
 
 END SUBROUTINE SetNewElem
 
@@ -523,8 +538,9 @@ SUBROUTINE AssembleKM(Init,p, ErrStat, ErrMsg)
    REAL(ReKi)               :: DirCos(3, 3)              ! direction cosine matrices
    REAL(ReKi)               :: L                         ! length of the element
    REAL(ReKi)               :: r1, r2, t, Iyy, Jzz, Ixx, A, kappa, nu, ratioSq, D_inner, D_outer
+   REAL(ReKi)               :: kh, kr, kt, ch, cr, ct, h1, h2, Kz, Ktor, mh, Ir, mt, h3, mz, Itor, Cz, Ctor ! SLPM parameters
    LOGICAL                  :: shear
-   REAL(ReKi), ALLOCATABLE  :: Ke(:,:), Me(:, :), FGe(:) ! element stiffness and mass matrices gravity force vector
+   REAL(ReKi), ALLOCATABLE  :: Ke(:,:), Ce(:,:), Me(:, :), FGe(:) ! element stiffness and mass matrices gravity force vector
    INTEGER, DIMENSION(NNE)  :: nn                        ! node number in element 
    INTEGER                  :: r
    INTEGER(IntKi)           :: ErrStat2
@@ -554,22 +570,26 @@ SUBROUTINE AssembleKM(Init,p, ErrStat, ErrMsg)
    ENDIF
 
    CALL AllocAry( Ke,     NNE*6,         NNE*6 , 'Ke',      ErrStat2, ErrMsg2); if(Failed()) return; ! element stiffness matrix
+   CALL AllocAry( Ce,     NNE*6,         NNE*6 , 'Ce',      ErrStat2, ErrMsg2); if(Failed()) return; ! element damping matrix
    CALL AllocAry( Me,     NNE*6,         NNE*6 , 'Me',      ErrStat2, ErrMsg2); if(Failed()) return; ! element mass matrix 
    CALL AllocAry( FGe,    NNE*6,                 'FGe',     ErrStat2, ErrMsg2); if(Failed()) return; ! element gravity force vector 
    CALL AllocAry( Init%K, Init%TDOF, Init%TDOF , 'Init%K',  ErrStat2, ErrMsg2); if(Failed()) return; ! system stiffness matrix 
-   CALL AllocAry( Init%m, Init%TDOF, Init%TDOF , 'Init%M',  ErrStat2, ErrMsg2); if(Failed()) return; ! system mass matrix 
+   CALL AllocAry( Init%C, Init%TDOF, Init%TDOF , 'Init%C',  ErrStat2, ErrMsg2); if(Failed()) return; ! system damping matrix 
+   CALL AllocAry( Init%M, Init%TDOF, Init%TDOF , 'Init%M',  ErrStat2, ErrMsg2); if(Failed()) return; ! system mass matrix 
    CALL AllocAry( Init%FG,Init%TDOF,             'Init%FG', ErrStat2, ErrMsg2); if(Failed()) return; ! system gravity force vector 
    Init%K  = 0.0_ReKi
+   Init%C  = 0.0_ReKi
    Init%M  = 0.0_ReKi
    Init%FG = 0.0_ReKi
-
    
    ! loop over all elements
    DO I = 1, Init%NElem
-   
-      DO J = 1, NNE
-         NN(J) = p%Elems(I, J + 1)
-      ENDDO
+
+   DO J = 1, NNE
+      NN(J) = p%Elems(I, J + 1)
+   ENDDO
+
+    IF (p%Elems(I, NNE + 4) == 0) THEN !Beam 
    
       N1 = p%Elems(I,       2)
       N2 = p%Elems(I, NNE + 1)
@@ -624,6 +644,7 @@ SUBROUTINE AssembleKM(Init,p, ErrStat, ErrMsg)
                  / ( ( 1.0 + ratioSq )**2 * ( 7.0 + 14.0*nu + 8.0*nu**2 ) + 4.0 * ratioSq * ( 5.0 + 10.0*nu + 4.0 *nu**2 ) )
       ENDIF
       
+      ! These are used in SubDyn_output.f90
       p%ElemProps(i)%Area = A
       p%ElemProps(i)%Length = L
       p%ElemProps(i)%Ixx = Ixx
@@ -639,6 +660,39 @@ SUBROUTINE AssembleKM(Init,p, ErrStat, ErrMsg)
       CALL ElemK(A, L, Ixx, Iyy, Jzz, Shear, kappa, E, G, DirCos, Ke)
       CALL ElemM(A, L, Ixx, Iyy, Jzz, rho, DirCos, Me)
       CALL ElemG(A, L, rho, DirCos, FGe, Init%g)
+
+    ELSE IF (p%Elems(I, NNE + 4) == 1) THEN !Simplified LPM
+
+      P1 = p%Elems(I, NNE + 2)
+      
+      kh =   Init%SLPMPropSets(P1, 2) 
+      kr =   Init%SLPMPropSets(P1, 3)
+      kt =   Init%SLPMPropSets(P1, 4)
+      ch =   Init%SLPMPropSets(P1, 5) 
+      cr =   Init%SLPMPropSets(P1, 6)
+      ct =   Init%SLPMPropSets(P1, 7)
+      mh =   Init%SLPMPropSets(P1, 8)
+      Ir =   Init%SLPMPropSets(P1, 9)
+      mt =   Init%SLPMPropSets(P1, 10)
+      h1 =   Init%SLPMPropSets(P1, 11)
+      h2 =   Init%SLPMPropSets(P1, 12)
+      h3 =   Init%SLPMPropSets(P1, 13)
+      Kz =   Init%SLPMPropSets(P1, 14)
+      Ktor = Init%SLPMPropSets(P1, 15)
+      mz =   Init%SLPMPropSets(P1, 16)
+      Itor = Init%SLPMPropSets(P1, 17)
+      Cz =   Init%SLPMPropSets(P1, 18)
+      Ctor = Init%SLPMPropSets(P1, 19)
+
+
+      CALL ElemKSLPM(kh, kr, kt, h1, Kz, Ktor, Ke)
+      CALL ElemCSLPM(ch, cr, ct, h2, Cz, Ctor, Ce)
+      CALL ElemMSLPM(mh, Ir, mt, h3, mz, Itor, Me)
+
+    ELSE
+       CALL Fatal('Element is not a beam nor a SLPM')
+       return
+    ENDIF 
       
       ! assemble element matrices to global matrices
       DO J = 1, NNE
@@ -648,6 +702,9 @@ SUBROUTINE AssembleKM(Init,p, ErrStat, ErrMsg)
             kn = nn(k)
             Init%K( (jn*6-5):(jn*6), (kn*6-5):(kn*6) ) = Init%K( (jn*6-5):(jn*6), (kn*6-5):(kn*6) ) + Ke( (J*6-5):(J*6), (K*6-5):(K*6) )
             Init%M( (jn*6-5):(jn*6), (kn*6-5):(kn*6) ) = Init%M( (jn*6-5):(jn*6), (kn*6-5):(kn*6) ) + Me( (J*6-5):(J*6), (K*6-5):(K*6) )
+            IF (p%Elems(I, NNE + 4) == 1) THEN
+              Init%C( (jn*6-5):(jn*6), (kn*6-5):(kn*6) ) = Init%C( (jn*6-5):(jn*6), (kn*6-5):(kn*6) ) + Ce( (J*6-5):(J*6), (K*6-5):(K*6) )
+            ENDIF
          ENDDO !K
       ENDDO !J
    ENDDO ! I end loop over elements
@@ -896,6 +953,227 @@ SUBROUTINE ElemM(A, L, Ixx, Iyy, Jzz, rho, DirCos, M)
 END SUBROUTINE ElemM
 
 !------------------------------------------------------------------------------------------------------
+!> Element stiffness matrix for simplified LPM members
+
+SUBROUTINE ElemKSLPM(kh, kr, kt, h1, Kz, Ktor, K)
+   REAL(ReKi), INTENT( IN) :: kh, kr, kt, h1, Kz, Ktor
+   REAL(ReKi), INTENT(OUT) :: K(12, 12) 
+   
+   K(1:12,1:12) = 0
+   
+   K( 7, 7) = kh + kt
+   K( 8, 8) = K( 7, 7)
+
+   K( 9, 9) = Kz
+
+   K( 10, 10) = kr + kt*h1*h1
+   K( 11, 11) = K(10, 10)
+
+   K( 12, 12) = Ktor
+      
+   K( 8, 10) = kt*h1
+   K( 10, 8) = K( 8, 10)
+   K( 7, 11) = - K( 8, 10)
+   K( 11, 7) = K( 7, 11)
+ 
+   K( 2,  4) = K( 7, 11)
+   K( 1,  5) = K( 8, 10)
+
+   K( 4, 10) = -K( 10, 10)
+   K( 5, 11) = -K( 11, 11)
+   
+   K( 3,  3)  = K(9,9)
+   K( 1,  1)  = K(7,7)
+   K( 2,  2)  = K(8,8)
+   K( 6,  6)  = K(12,12)
+   K( 4,  4)  = K(10,10)
+
+   K(5,5)  = K(11,11)
+   K(4,2)  = K(2,4)
+   K(5,1)  = K(1,5)
+   K(10,4) = K(4,10)
+   K(11,5) = K(5,11)
+   K(12,6)= -K(6,6)
+   K(10,2)=  K(4,2)
+   K(11,1)=  K(5,1)
+   K(9,3) = -K(3,3)
+   K(7,1) = -K(1,1)
+   K(8,2) = -K(2,2)
+   K(6, 12) = -K(6,6)
+   K(2, 10) =  K(4,2)
+   K(1, 11) =  K(5,1)
+   K(3, 9)  = -K(3,3)
+   K(1, 7)  = -K(1,1)
+   K(2, 8)  = -K(2,2)
+   K(7,5) = -K(5,1)
+   K(5,7) = -K(5,1)
+   K(8,4) = -K(4,2)
+   K(4,8) = -K(4,2)
+      
+END SUBROUTINE ElemKSLPM
+
+!------------------------------------------------------------------------------------------------------
+!> Element damping matrix for simplified LPM members
+
+SUBROUTINE ElemCSLPM(ch, cr, ct, h2, Cz, Ctor, C)
+   REAL(ReKi), INTENT( IN) :: ch, cr, ct, h2, Cz, Ctor
+   REAL(ReKi), INTENT(OUT) :: C(12, 12) 
+   
+   C(1:12,1:12) = 0
+   
+   C( 7, 7) = ch + ct
+   C( 8, 8) = C( 7, 7)
+
+   C( 9, 9) = Cz
+
+   C( 10, 10) = cr + ct*h2*h2
+   C( 11, 11) = C(10, 10)
+
+   C( 12, 12) = Ctor
+      
+   C( 8, 10) = ct*h2
+   C( 10, 8) = C( 8, 10)
+   C( 7, 11) = - C( 8, 10)
+   C( 11, 7) = C( 7, 11)
+ 
+   C( 2,  4) = C( 7, 11)
+   C( 1,  5) = C( 8, 10)
+
+   C( 4, 10) = -C( 10, 10)
+   C( 5, 11) = -C( 11, 11)
+   
+   C( 3,  3)  = C(9,9)
+   C( 1,  1)  = C(7,7)
+   C( 2,  2)  = C(8,8)
+   C( 6,  6)  = C(12,12)
+   C( 4,  4)  = C(10,10)
+
+   C(5,5)  = C(11,11)
+   C(4,2)  = C(2,4)
+   C(5,1)  = C(1,5)
+   C(10,4) = C(4,10)
+   C(11,5) = C(5,11)
+   C(12,6)= -C(6,6)
+   C(10,2)=  C(4,2)
+   C(11,1)=  C(5,1)
+   C(9,3) = -C(3,3)
+   C(7,1) = -C(1,1)
+   C(8,2) = -C(2,2)
+   C(6, 12) = -C(6,6)
+   C(2, 10) =  C(4,2)
+   C(1, 11) =  C(5,1)
+   C(3, 9)  = -C(3,3)
+   C(1, 7)  = -C(1,1)
+   C(2, 8)  = -C(2,2)
+   C(7,5) = -C(5,1)
+   C(5,7) = -C(5,1)
+   C(8,4) = -C(4,2)
+   C(4,8) = -C(4,2)
+      
+END SUBROUTINE ElemCSLPM
+
+!------------------------------------------------------------------------------------------------------
+!> Element mass matrix for simplified LPM members
+
+SUBROUTINE ElemMSLPM(mh, Ir, mt, h3, mz, Itor, M)
+   REAL(ReKi), INTENT( IN) :: mh, Ir, mt, h3, mz, Itor
+   REAL(ReKi), INTENT(OUT) :: M(12, 12) 
+
+   
+   M(1:12,1:12) = 0
+   
+   M( 7, 7) = mh + mt
+   M( 8, 8) = M( 7, 7)
+
+   M( 9, 9) = mz
+
+   M( 10, 10) = Ir + mt*h3*h3
+   M( 11, 11) = M(10, 10)
+
+   M( 12, 12) = Itor
+      
+   M( 8, 10) = mt*h3
+   M( 10, 8) = M( 8, 10)
+   M( 7, 11) = - M( 8, 10)
+   M( 11, 7) = M( 7, 11)
+
+!!! esto es una prueba para debugging. Debe ser cero
+!!! de hecho los valores no son correctos
+
+!   M( 2,  4) = -M( 8,10)
+!   M( 1,  5) =  M( 8,10)
+!   M( 3,  9) =  M (9,9)/2
+!   M( 5,  7) =  M(7 ,7)
+!   M( 4,  8) = -M(11,11) 
+!   M( 6, 12) =  M(12,12)/2
+!   M( 2, 10) =  M(1,5) 
+!   M( 1, 11) = -M(2,10)
+!   M( 8, 10) =  M(2,10)
+!   M( 7, 11) = -M(8,10) 
+!   M( 1,  7) =  M(7,7)
+!   M( 2,  8) =  M(1,7)
+!   M( 4, 10) = -M(11,11) 
+!   M( 5, 11) =  M(4,10)
+   
+!   M( 3,  3) = M( 9,  9)
+!   M( 1,  1) = M( 7,  7)
+!   M( 2,  2) = M( 8,  8)
+!   M( 6,  6) = M(12, 12)
+!   M( 4,  4) = M(10, 10)
+!   M( 5,  5) = M(11, 11)
+!   M( 4,  2) = M( 2,  4)
+!   M( 5,  1) = M( 1,  5)
+!   M( 9,  3) = M( 3,  9)
+!   M( 7,  5) = M( 5,  7)
+!   M( 8,  4) = M( 4,  8)
+!   M(12,  6) = M( 6, 12)
+!   M(10,  2) = M( 2, 10)
+!   M(11,  1) = M( 1, 11)
+!   M(10,  8) = M( 8, 10)
+!   M(11,  7) = M( 7, 11)
+!   M( 7,  1) = M( 1,  7)
+!   M( 8,  2) = M( 2,  8)
+!   M(10,  4) = M( 4, 10)
+!   M(11,  5) = M( 5, 11)
+      
+END SUBROUTINE ElemMSLPM
+
+!------------------------------------------------------------------------------------------------------
+!> Compute system rayleigh damping matrix 
+! The damping ratio is saved in Init%JDampings(1)
+SUBROUTINE RAYLEIGH(Init, p, FEMParams)
+   TYPE(SD_InitType),            INTENT(INOUT) :: Init
+   TYPE(SD_ParameterType),       INTENT(IN   ) :: p
+   TYPE(FEM_MatArrays)   ,       INTENT(IN   ) :: FEMparams     ! FEM parameters
+
+   !Local variables
+   REAL(ReKi)                                  :: alpha0, alpha1, w1, w2
+   INTEGER(IntKi)                              :: I,J
+
+   ! We will considere the first two pairs of modes.
+
+   DO I=1,Init%TDOF
+      IF ( ABS( FEMParams%Omega(I) - FEMParams%Omega(I+1) ) < FEMParams%Omega(I)/100.0 ) THEN
+         w1 = FEMParams%Omega(I)
+         exit
+      END IF
+   ENDDO
+
+   DO J=I+1,Init%TDOF
+      IF ( ABS( FEMParams%Omega(J) - FEMParams%Omega(J+1) ) < FEMParams%Omega(J)/100.0 ) THEN
+         w2 = FEMParams%Omega(J)
+         exit
+      END IF
+   ENDDO
+
+   alpha0 = Init%JDampings(1) * 2.0 * w1 * w2 / (w1 + w2)
+   alpha1 = Init%JDampings(1) * 2.0  / (w1 + w2)
+
+   Init%C = Init%C + alpha0 * Init%M + alpha1 * Init%K
+
+END SUBROUTINE RAYLEIGH
+
+!------------------------------------------------------------------------------------------------------
 !> Sets a list of DOF indices and the value these DOF should have
 !! NOTE: need p%Reacts to have an updated first column that uses indices and not JointID
 SUBROUTINE InitConstr(Init, p)
@@ -914,26 +1192,26 @@ SUBROUTINE InitConstr(Init, p)
 END SUBROUTINE InitConstr
 
 !> Apply constraint (Boundary conditions) on Mass and Stiffness matrices
-SUBROUTINE ApplyConstr(Init,p)
-   TYPE(SD_InitType     ),INTENT(INOUT):: Init
-   TYPE(SD_ParameterType),INTENT(IN   ):: p
+!SUBROUTINE ApplyConstr(Init,p)
+!   TYPE(SD_InitType     ),INTENT(INOUT):: Init
+!   TYPE(SD_ParameterType),INTENT(IN   ):: p
+!   
+!   INTEGER :: I !, J, k
+!   INTEGER :: row_n !bgn_j, end_j,
    
-   INTEGER :: I !, J, k
-   INTEGER :: row_n !bgn_j, end_j,
-   
-   DO I = 1, p%NReact*6
-      row_n = Init%BCs(I, 1)
-      IF (Init%BCs(I, 2) == 1) THEN
-         Init%K(row_n,:    )= 0
-         Init%K(:    ,row_n)= 0
-         Init%K(row_n,row_n)= 1
+!   DO I = 1, p%NReact*6
+!      row_n = Init%BCs(I, 1)
+!      IF (Init%BCs(I, 2) == 1) THEN
+!         Init%K(row_n,:    )= 0
+!         Init%K(:    ,row_n)= 0
+!         Init%K(row_n,row_n)= 1
 
-         Init%M(row_n,:    )= 0
-         Init%M(:    ,row_n)= 0
-         Init%M(row_n,row_n)= 0
-      ENDIF
-   ENDDO ! I, loop on reaction nodes
-END SUBROUTINE ApplyConstr
+!         Init%M(row_n,:    )= 0
+!         Init%M(:    ,row_n)= 0
+!         Init%M(row_n,row_n)= 0
+!      ENDIF
+!   ENDDO ! I, loop on reaction nodes
+!END SUBROUTINE ApplyConstr
 
 !------------------------------------------------------------------------------------------------------
 !> calculates the lumped forces and moments due to gravity on a given element:

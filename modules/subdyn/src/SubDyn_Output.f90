@@ -4250,13 +4250,18 @@ SUBROUTINE SDOut_MapOutputs( CurrentTime, u,p,x, y, m, AllOuts, ErrStat, ErrMsg 
    
    !Create a variable that lists Y2 and adds removed constrained nodes' dofs; we will be using it to carry out other calculations with a special indexing array
    yout =0 !Initialize and populate with Y2 data  
-   yout(1:         p%UrbarL       ) = m%UR_bar
-   yout(p%URbarL+1:p%URbarL+p%DOFL) = m%UL
-  
+   yout(1                   :p%UrbarL)                   = m%UR_bar
+   yout(p%URbarL+1          :p%URbarL+p%DOFL)            = m%UL
+
    !Same for a variable that deals with Udotdot
    uddout =0 !Initialize and populate with Udotdot data
-   uddout(1          : p%URbarL         ) = m%UR_bar_dotdot
-   uddout(p%URbarL+1 : p%URbarL+p%DOFL  ) = m%UL_dotdot
+   uddout(1                 :p%URbarL         )          = m%UR_bar_dotdot
+   uddout(p%URbarL+1        :p%URbarL+p%DOFL  )          = m%UL_dotdot
+
+   IF (p%SeismicInp) THEN
+    yout(p%URbarL+p%DOFL+1  :p%URbarL+p%DOFL+6*p%Nreact) = p%RRbase*m%Ug
+    uddout(p%URbarL+p%DOFL+1:p%URbarL+p%DOFL+6*p%Nreact) = p%RRbase*m%Uddotg
+   END IF
          
       ! Only generate member-based outputs for the number of user-requested member outputs
       !Now store and identify needed output as requested by user
